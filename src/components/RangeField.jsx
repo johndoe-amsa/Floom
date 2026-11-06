@@ -1,9 +1,9 @@
-export default function RangeField({ id, label, min, max, step, decimals, unit = '', value, onChange, disabled }) {
+export default function RangeField({ id, label, min, max, step, decimals, unit = '', scale = 1, value, onChange, disabled }) {
   return (
     <div className="field">
       <div className="field__row">
         <label htmlFor={'r-' + id}>{label}</label>
-        <output id={'o-' + id} htmlFor={'r-' + id}>{Number(value).toFixed(decimals) + unit}</output>
+        <output id={'o-' + id} htmlFor={'r-' + id}>{(Number(value) * scale).toFixed(decimals) + unit}</output>
       </div>
       <input
         type="range"

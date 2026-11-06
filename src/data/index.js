@@ -31,4 +31,25 @@ export const INITIAL_STATE = {
   paletteIndex: 0,
   scale: 0.9, warp: 1.5, contrast: 2.2, streak: 0.6, angle: 20, grain: 0,
   seed: 7, format: '1:1', exportSize: 2048,
+  mode: 'palette',
+}
+
+// ---------- Mode « Couleurs de marque » ----------
+export const MAX_BRAND_COLORS = 8
+
+export const BRAND_SLIDERS = [
+  { key: 'variance', label: 'Écart de luminosité', min: 0, max: 1,  step: 0.01, decimals: 0, scale: 100, unit: ' %' },
+  { key: 'hueShift', label: 'Écart de teinte',     min: 0, max: 30, step: 1,    decimals: 0, unit: '°' },
+  { key: 'softness', label: 'Fondu entre couleurs', min: 0, max: 1, step: 0.01, decimals: 0, scale: 100, unit: ' %' },
+]
+
+export const DEFAULT_BRAND = {
+  colors: [
+    { hex: '#1B5FC2', weight: 60 },
+    { hex: '#59A8FF', weight: 30 },
+    { hex: '#FFFFFF', weight: 10 },
+  ],
+  variance: 0.25,
+  hueShift: 0,
+  softness: 0.7,
 }

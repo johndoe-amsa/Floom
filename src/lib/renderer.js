@@ -1,4 +1,10 @@
-// Rendu WebGL du dégradé (shader identique à la version HTML d'origine).
+// Rendu WebGL du dégradé. La rampe de couleurs est une texture 1D construite côté JS :
+// - mode palettes : rampe à 5 couleurs, identique au shader d'origine ;
+// - mode marque : une passe basse résolution mesure la répartition du champ, puis la rampe est
+//   égalisée pour que chaque couleur couvre exactement la part de surface demandée.
+import { RAMP_N, buildPaletteRamp, buildBrandBase, composeEqualized } from './ramp'
+
+const PROBE_LONG_SIDE = 160
 
 const VERT = 'attribute vec2 aPos; void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }'
 const FRAG = [
@@ -9,7 +15,9 @@ const FRAG = [
   '#endif',
   'uniform vec2 uRes;',
   'uniform float uSeed, uScale, uWarp, uContrast, uStreak, uAngle, uGrain;',
-  'uniform vec3 uC0, uC1, uC2, uC3, uC4;',
+  'uniform sampler2D uRamp;',
+  'uniform vec2 uRange;',
+  'uniform float uPass;',
   'float hash(vec2 p){',
   '  vec3 p3 = fract(vec3(p.xyx) * 0.1031);',
   '  p3 += dot(p3, p3.yzx + 33.33);',
@@ -29,12 +37,8 @@ const FRAG = [
   '  return v / 0.65;',
   '}',
   'vec3 ramp(float t){',
-  '  t = clamp(t, 0.0, 0.9999) * 4.0;',
-  '  float x = fract(t); x = x*x*(3.0 - 2.0*x);',
-  '  if (t < 1.0) return mix(uC0, uC1, x);',
-  '  if (t < 2.0) return mix(uC1, uC2, x);',
-  '  if (t < 3.0) return mix(uC2, uC3, x);',
-  '  return mix(uC3, uC4, x);',
+  '  float s = clamp((t - uRange.x) / (uRange.y - uRange.x), 0.0, 1.0);',
+  '  return texture2D(uRamp, vec2((s * ' + (RAMP_N - 1).toFixed(1) + ' + 0.5) / ' + RAMP_N.toFixed(1) + ', 0.5)).rgb;',
   '}',
   'void main(){',
   '  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / min(uRes.x, uRes.y);',
@@ -45,7 +49,12 @@ const FRAG = [
   '  vec2 q = vec2(fbm(p), fbm(p + vec2(5.2, 1.3)));',
   '  vec2 r = vec2(fbm(p + uWarp * q + vec2(1.7, 9.2)), fbm(p + uWarp * q + vec2(8.3, 2.8)));',
   '  float f = fbm(p + uWarp * r);',
-  '  float t = clamp((f - 0.5) * uContrast + 0.5 + uv.y * 0.3, 0.0, 1.0);',
+  '  float t = (f - 0.5) * uContrast + 0.5 + uv.y * 0.3;',
+  '  if (uPass > 0.5) {',
+  '    float e = clamp((t + 3.0) / 7.0, 0.0, 1.0) * 255.0;',
+  '    gl_FragColor = vec4(floor(e) / 255.0, fract(e), 0.0, 1.0);',
+  '    return;',
+  '  }',
   '  vec3 col = ramp(t);',
   '  vec2 dir = normalize(vec2(1.0, -0.4));',
   '  float ph = dot(p, dir) * 0.7 + (q.x + r.y) * 1.6;',
@@ -58,12 +67,7 @@ const FRAG = [
   '}',
 ].join('\n')
 
-const UNIFORMS = ['uRes', 'uSeed', 'uScale', 'uWarp', 'uContrast', 'uStreak', 'uAngle', 'uGrain', 'uC0', 'uC1', 'uC2', 'uC3', 'uC4']
-
-function hexToRgb(hex) {
-  const n = parseInt(hex.slice(1), 16)
-  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]
-}
+const UNIFORMS = ['uRes', 'uSeed', 'uScale', 'uWarp', 'uContrast', 'uStreak', 'uAngle', 'uGrain', 'uRamp', 'uRange', 'uPass']
 
 // Renvoie { canvas, draw(params, w, h) } ou null si WebGL n'est pas disponible.
 export function makeRenderer(canvas) {
@@ -104,13 +108,73 @@ export function makeRenderer(canvas) {
   const u = {}
   UNIFORMS.forEach((k) => { u[k] = gl.getUniformLocation(prog, k) })
 
+  // Texture de la rampe (unité 0).
+  const rampTex = gl.createTexture()
+  gl.activeTexture(gl.TEXTURE0)
+  gl.bindTexture(gl.TEXTURE_2D, rampTex)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, RAMP_N, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+  gl.uniform1i(u.uRamp, 0)
+
+  // Cible hors écran pour la passe de mesure.
+  const probeTex = gl.createTexture()
+  const fbo = gl.createFramebuffer()
+  let probeW = 0, probeH = 0
+  let probePixels = null
+
+  let uploadedKey = null // clé de la rampe actuellement dans la texture (mode palettes)
+  let brandKey = null
+  let brandBase = null
+
+  function uploadRamp(data) {
+    gl.bindTexture(gl.TEXTURE_2D, rampTex)
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, RAMP_N, 1, gl.RGBA, gl.UNSIGNED_BYTE, data)
+  }
+
+  // Rend le champ brut en basse résolution et renvoie ses valeurs triées.
+  function probe(w, h) {
+    const k = PROBE_LONG_SIDE / Math.max(w, h)
+    const pw = Math.max(8, Math.round(w * k)), ph = Math.max(8, Math.round(h * k))
+    if (pw !== probeW || ph !== probeH) {
+      probeW = pw; probeH = ph
+      gl.bindTexture(gl.TEXTURE_2D, probeTex)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, pw, ph, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, probeTex, 0)
+      probePixels = new Uint8Array(pw * ph * 4)
+      gl.bindTexture(gl.TEXTURE_2D, rampTex)
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+    gl.viewport(0, 0, pw, ph)
+    // uRes garde le format final : seule la densité d'échantillonnage change.
+    gl.uniform2f(u.uRes, pw, ph)
+    gl.uniform1f(u.uPass, 1)
+    gl.drawArrays(gl.TRIANGLES, 0, 3)
+    gl.readPixels(0, 0, pw, ph, gl.RGBA, gl.UNSIGNED_BYTE, probePixels)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.uniform1f(u.uPass, 0)
+    const n = pw * ph
+    const vals = new Float32Array(n)
+    for (let i = 0; i < n; i++) {
+      const e = (probePixels[i * 4] + probePixels[i * 4 + 1] / 255) / 255
+      vals[i] = e * 7 - 3
+    }
+    vals.sort()
+    return vals
+  }
+
   return {
     canvas,
     draw(p, w, h) {
       if (canvas.width !== w) canvas.width = w
       if (canvas.height !== h) canvas.height = h
-      gl.viewport(0, 0, w, h)
-      gl.uniform2f(u.uRes, w, h)
       gl.uniform1f(u.uSeed, p.seed)
       gl.uniform1f(u.uScale, p.scale)
       gl.uniform1f(u.uWarp, p.warp)
@@ -118,10 +182,23 @@ export function makeRenderer(canvas) {
       gl.uniform1f(u.uStreak, p.streak)
       gl.uniform1f(u.uAngle, p.angle * Math.PI / 180)
       gl.uniform1f(u.uGrain, p.grain)
-      for (let i = 0; i < 5; i++) {
-        const c = hexToRgb(p.colors[i])
-        gl.uniform3f(u['uC' + i], c[0], c[1], c[2])
+
+      if (p.mode === 'brand') {
+        const key = JSON.stringify(p.brand)
+        if (key !== brandKey) { brandKey = key; brandBase = buildBrandBase(p.brand) }
+        const eq = composeEqualized(brandBase, probe(w, h))
+        uploadRamp(eq.data)
+        uploadedKey = null
+        gl.uniform2f(u.uRange, eq.min, eq.max)
+      } else {
+        const key = p.colors.join(',')
+        if (key !== uploadedKey) { uploadedKey = key; uploadRamp(buildPaletteRamp(p.colors)) }
+        gl.uniform2f(u.uRange, 0, 1)
       }
+
+      gl.viewport(0, 0, w, h)
+      gl.uniform2f(u.uRes, w, h)
+      gl.uniform1f(u.uPass, 0)
       gl.drawArrays(gl.TRIANGLES, 0, 3)
     },
   }
